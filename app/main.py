@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from . import alignment
 from .annotation import build_annotation_migrations, validate_annotations
 from .captions import build_captions
+from .clip_plan import build_clip_plan, validate_clip_selections
 from .entity_links import build_entity_links, validate_entity_links
 from .errors import InvalidTimelineError
 from .schemas import (
@@ -19,6 +20,8 @@ from .schemas import (
     AnnotationMigration,
     CaptionSegment,
     CaptionsRequest,
+    ClipPlanRequest,
+    ClipPlanResponse,
     EntityLinksRequest,
     EntityLinksResponse,
     HealthResponse,
@@ -71,9 +74,10 @@ async def invalid_timeline_handler(_request: Request,
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_handler(_request: Request,
+async def validation_handler(request: Request,
                              exc: RequestValidationError) -> JSONResponse:
     """把 Pydantic 校验错误转成明确的中文提示。"""
+    is_clip_plan = request.url.path == "/clip-plan"
     messages = []
     for err in exc.errors():
         loc = ".".join(str(p) for p in err["loc"] if p != "body") or "请求体"
@@ -101,7 +105,7 @@ async def validation_handler(_request: Request,
             elif loc.endswith("bucket_ms"):
                 range_hint = "，允许范围为 1000～60000"
             elif loc.endswith("padding_ms"):
-                range_hint = "，允许范围为 0～1000"
+                range_hint = "，允许范围为 0～2000" if is_clip_plan else "，允许范围为 0～1000"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
@@ -116,6 +120,8 @@ async def validation_handler(_request: Request,
                 messages.append("批注数量无效，允许范围为 1～100 条")
             elif loc.endswith("terms"):
                 messages.append("敏感词数量无效，允许范围为 1～50 个")
+            elif loc.endswith("selections"):
+                messages.append("选择区间数量无效，允许范围为 1～20 个")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -263,3 +269,16 @@ async def redact(req: RedactRequest) -> RedactResponse:
     return build_redaction(
         req.revised_text, timeline["chars"], req.terms, req.padding_ms,
         req.total_duration)
+
+
+@app.post(
+    "/clip-plan",
+    response_model=ClipPlanResponse,
+    tags=["成片剪辑"],
+)
+async def clip_plan(req: ClipPlanRequest) -> ClipPlanResponse:
+    """把选中字符区间映射为源录音裁剪与成片拼接方案。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_clip_selections(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_clip_plan(req.revised_text, timeline["chars"], req)

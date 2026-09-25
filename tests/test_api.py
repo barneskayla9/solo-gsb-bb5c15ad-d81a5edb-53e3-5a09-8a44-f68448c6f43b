@@ -1912,3 +1912,270 @@ def test_redact_extra_field_rejected(client):
         "terms": ["机密"], "padding_ms": 0, "bogus": 1})
     assert r.status_code == 422
     assert "不允许" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 成片剪辑规划 POST /clip-plan
+# ---------------------------------------------------------------------------
+def _clip(client, items, revised, selections, padding_ms=0, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "selections": [
+            {"start_index": s, "end_index": e} for s, e in selections],
+        "padding_ms": padding_ms,
+    }
+    return client.post("/clip-plan", json=payload)
+
+
+def test_clip_plan_two_separate_segments_with_padding(client):
+    # 选 “你好”[0,2) 与 “世界”[3,5)，扩 30ms，间隔不合并；成片连续拼接
+    r = _clip(client, [
+        ("你", 0, 100), ("好", 100, 200), ("呀", 300, 400),
+        ("世", 500, 600), ("界", 600, 700),
+    ], "你好呀世界", [(0, 2), (3, 5)], padding_ms=30, total=800)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "segments": [
+            {"segment_index": 0, "source_start": 0, "source_end": 230,
+             "output_start": 0, "output_end": 230, "duration_ms": 230},
+            {"segment_index": 1, "source_start": 470, "source_end": 730,
+             "output_start": 230, "output_end": 490, "duration_ms": 260},
+        ],
+        "total_duration": 490,
+        "selections": [
+            {"index": 0, "start_index": 0, "end_index": 2, "text": "你好",
+             "segment_index": 0, "output_start": 0, "output_end": 200},
+            {"index": 1, "start_index": 3, "end_index": 5, "text": "世界",
+             "segment_index": 1, "output_start": 260, "output_end": 460},
+        ],
+    }
+
+
+def test_clip_plan_padding_bridges_gap_merges_segments(client):
+    # 源区间 [0,200] 扩 50 → [0,250]；[300,500] 扩 50 → [250,550]，
+    # 端点相接 → 合并成一段，声音不重复
+    r = _clip(client, [
+        ("张", 0, 100), ("三", 100, 200), ("说", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三说李四", [(0, 2), (3, 5)], padding_ms=50, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["segments"] == [
+        {"segment_index": 0, "source_start": 0, "source_end": 550,
+         "output_start": 0, "output_end": 550, "duration_ms": 550}]
+    assert body["total_duration"] == 550
+    assert [s["segment_index"] for s in body["selections"]] == [0, 0]
+    sel0, sel1 = body["selections"]
+    assert (sel0["output_start"], sel0["output_end"]) == (0, 200)
+    # “李四”原时间 [300,500] 随合并片段整体平移为 [300,500]（片段源起点也是 0）
+    assert (sel1["output_start"], sel1["output_end"]) == (300, 500)
+
+
+def test_clip_plan_touching_char_selections_share_segment(client):
+    # 端点相接的两个字符区间（“ab” 与 “cd”）天然在同一合并片段内
+    r = _clip(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300), ("d", 300, 400),
+    ], "abcd", [(0, 2), (2, 4)], padding_ms=0, total=500)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["segments"] == [
+        {"segment_index": 0, "source_start": 0, "source_end": 400,
+         "output_start": 0, "output_end": 400, "duration_ms": 400}]
+    assert body["total_duration"] == 400
+    assert body["selections"][1] == {
+        "index": 1, "start_index": 2, "end_index": 4, "text": "cd",
+        "segment_index": 0, "output_start": 200, "output_end": 400}
+
+
+def test_clip_plan_padding_clamped_to_recording_bounds(client):
+    r = _clip(client, [
+        ("你", 0, 100), ("机", 100, 200), ("密", 200, 300),
+    ], "你机密", [(1, 3)], padding_ms=2000, total=300)
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"] == [
+        {"segment_index": 0, "source_start": 0, "source_end": 300,
+         "output_start": 0, "output_end": 300, "duration_ms": 300}]
+
+
+def test_clip_plan_output_timeline_concatenates_with_offset(client):
+    # 两段：[100,200] 与 [500,600]，padding=0；第二段成片时间整体后移 100ms
+    r = _clip(client, [
+        ("a", 100, 200), ("b", 300, 400), ("c", 500, 600),
+    ], "abc", [(0, 1), (2, 3)], padding_ms=0, total=700)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_duration"] == 200
+    assert body["segments"][1] == {
+        "segment_index": 1, "source_start": 500, "source_end": 600,
+        "output_start": 100, "output_end": 200, "duration_ms": 100}
+    assert body["selections"][1] == {
+        "index": 1, "start_index": 2, "end_index": 3, "text": "c",
+        "segment_index": 1, "output_start": 100, "output_end": 200}
+
+
+def test_clip_plan_single_selection(client):
+    r = _clip(client, [("你", 0, 100), ("好", 200, 300)], "你好", [(0, 2)],
+              padding_ms=10, total=400)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["segments"] == [
+        {"segment_index": 0, "source_start": 0, "source_end": 310,
+         "output_start": 0, "output_end": 310, "duration_ms": 310}]
+    assert body["total_duration"] == 310
+    assert len(body["selections"]) == 1
+
+
+def test_clip_plan_uses_computed_timeline_for_inserted_chars(client):
+    # “要”为新增字符，在空档 [100,900] 内推算；选择含该字符时以推算时间为准
+    r = _clip(client, [("机", 0, 100), ("密", 900, 1000)], "机要密",
+              [(0, 3)], padding_ms=0, total=1000)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["segments"][0]["source_start"] == 0
+    assert body["segments"][0]["source_end"] == 1000
+    assert body["selections"][0]["text"] == "机要密"
+
+
+def test_clip_plan_reuses_alignment_validation(client):
+    r = _clip(client, [("a", 300, 100)], "a", [(0, 1)], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_clip_plan_negative_index_rejected(client):
+    r = _clip(client, [("a", 0, 100)], "a", [(-1, 1)], total=200)
+    assert r.status_code == 422
+    assert "负数" in r.json()["detail"]
+
+
+def test_clip_plan_empty_interval_rejected(client):
+    r = _clip(client, [("a", 0, 100)], "a", [(1, 1)], total=200)
+    assert r.status_code == 422
+    assert "非空半开区间" in r.json()["detail"]
+
+
+def test_clip_plan_out_of_text_rejected(client):
+    r = _clip(client, [("a", 0, 100)], "a", [(0, 2)], total=200)
+    assert r.status_code == 422
+    assert "超出修订稿长度" in r.json()["detail"]
+
+
+def test_clip_plan_not_ordered_rejected(client):
+    r = _clip(client, [("a", 0, 100), ("b", 100, 200), ("c", 200, 300)],
+              "abc", [(2, 3), (0, 1)], total=400)
+    assert r.status_code == 422
+    assert "顺序" in r.json()["detail"]
+
+
+def test_clip_plan_overlapping_intervals_rejected(client):
+    r = _clip(client, [("a", 0, 100), ("b", 100, 200), ("c", 200, 300)],
+              "abc", [(0, 2), (1, 3)], total=400)
+    assert r.status_code == 422
+    assert "不得重叠" in r.json()["detail"]
+
+
+def test_clip_plan_zero_duration_mapped_selection_rejected(client):
+    # 两个锚点字符同一时间槽，中间新增字符推算为零时长，选中该新增字符 → 422
+    r = _clip(client, [("a", 100, 100), ("b", 100, 100)], "axb",
+              [(1, 2)], total=300)
+    assert r.status_code == 422
+    assert "零时长" in r.json()["detail"]
+
+
+def test_clip_plan_selection_touching_zero_duration_boundary(client):
+    # 新增字符 x 在零空档 [100,100] 内推算为零时长，但与前后正时长字符一起
+    # 选中时整体区间为 [0,100] 正时长，合法
+    r = _clip(client, [("a", 0, 100), ("b", 100, 100)], "axb",
+              [(0, 3)], total=300)
+    assert r.status_code == 200, r.text
+    seg = r.json()["segments"][0]
+    assert (seg["source_start"], seg["source_end"]) == (0, 100)
+    assert seg["duration_ms"] == 100
+
+
+def test_clip_plan_padding_ms_range(client):
+    base = lambda pad: _clip(client, [("a", 0, 100)], "a", [(0, 1)],
+                             padding_ms=pad, total=200)
+    for bad in (-1, 2001):
+        r = base(bad)
+        assert r.status_code == 422, (bad, r.text)
+        assert "0～2000" in r.json()["detail"]
+    for good in (0, 2000):
+        r = base(good)
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_clip_plan_padding_ms_wrong_type(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a",
+        "selections": [{"start_index": 0, "end_index": 1}],
+        "padding_ms": "50"})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_clip_plan_selections_count_range(client):
+    r0 = client.post("/clip-plan", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a", "selections": [], "padding_ms": 0})
+    assert r0.status_code == 422
+    assert "1～20" in r0.json()["detail"]
+
+    text = "a" * 20
+    items = [("a", i * 10, i * 10 + 10) for i in range(20)]
+    r21 = client.post("/clip-plan", json={
+        "recognized": rc(items), "total_duration": 300,
+        "revised_text": text,
+        "selections": [{"start_index": i, "end_index": i + 1}
+                       for i in range(21)], "padding_ms": 0})
+    assert r21.status_code == 422
+    assert "1～20" in r21.json()["detail"]
+
+    r20 = client.post("/clip-plan", json={
+        "recognized": rc(items), "total_duration": 300,
+        "revised_text": text,
+        "selections": [{"start_index": i, "end_index": i + 1}
+                       for i in range(20)], "padding_ms": 0})
+    assert r20.status_code == 200, r20.text
+
+
+def test_clip_plan_index_wrong_type(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a",
+        "selections": [{"start_index": "0", "end_index": 1}],
+        "padding_ms": 0})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_clip_plan_missing_fields_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": [], "total_duration": 0, "revised_text": ""})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "selections" in detail
+    assert "padding_ms" in detail
+
+
+def test_clip_plan_extra_field_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a",
+        "selections": [{"start_index": 0, "end_index": 1}],
+        "padding_ms": 0, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_clip_plan_selection_extra_field_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc([("a", 0, 100)]), "total_duration": 200,
+        "revised_text": "a",
+        "selections": [{"start_index": 0, "end_index": 1, "bogus": 1}],
+        "padding_ms": 0})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

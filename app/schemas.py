@@ -157,6 +157,32 @@ class RedactRequest(AlignRequest):
     )
 
 
+class ClipSelection(BaseModel):
+    """单个成片选择：修订稿上的非空半开字符区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_index: StrictInt = Field(
+        ..., description="选择区间在修订稿中的起始字符下标（从 0 开始，半开区间）"
+    )
+    end_index: StrictInt = Field(
+        ..., description="选择区间在修订稿中的结束字符下标（不含该位置），须大于 start_index"
+    )
+
+
+class ClipPlanRequest(AlignRequest):
+    """校时输入与成片选择参数：1～20 个有序、互不重叠的非空字符区间与留白。"""
+
+    selections: list[ClipSelection] = Field(
+        ..., min_length=1, max_length=20,
+        description="按修订稿顺序排列、互不重叠（可端点相接）的非空半开字符区间（1～20 个）",
+    )
+    padding_ms: StrictInt = Field(
+        ..., ge=0, le=2000,
+        description="每个源录音区间向两侧扩展的片段留白毫秒数（0～2000），扩展后裁剪到录音边界",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -302,3 +328,43 @@ class RedactResponse(BaseModel):
         ..., description="重叠或相接命中合并后的敏感字符区间，按原文顺序；无命中为空列表")
     mute_intervals: list[MuteInterval] = Field(
         ..., description="供音频静音的毫秒区间：各区间扩展 padding、裁剪到录音边界后再合并；无命中为空列表")
+
+
+class ClipSegment(BaseModel):
+    segment_index: int = Field(
+        ..., description="成片片段序号（从 0 开始，按源录音时间升序）")
+    source_start: int = Field(
+        ..., description="该片段在源录音中的起始毫秒（含），已扩展留白并裁剪到录音边界")
+    source_end: int = Field(
+        ..., description="该片段在源录音中的结束毫秒（不含），已扩展留白并裁剪到录音边界")
+    output_start: int = Field(
+        ..., description="该片段在成片中的起始毫秒（含，从 0 起连续拼接）")
+    output_end: int = Field(
+        ..., description="该片段在成片中的结束毫秒（不含）")
+    duration_ms: int = Field(
+        ..., description="该片段成片时长（毫秒），等于 source_end - source_start")
+
+
+class ClipSelectionResult(BaseModel):
+    index: int = Field(
+        ..., description="选择区间的输入序号（从 0 开始，按输入顺序返回）")
+    start_index: int = Field(
+        ..., description="选择区间在修订稿中的起始字符下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="选择区间在修订稿中的结束字符下标（不含该位置）")
+    text: str = Field(..., description="该选择区间对应的修订稿原文")
+    segment_index: int = Field(
+        ..., description="所属合并成片片段的序号（从 0 开始）")
+    output_start: int = Field(
+        ..., description="该选择内容在成片中的起始毫秒（含，随所属片段整体平移）")
+    output_end: int = Field(
+        ..., description="该选择内容在成片中的结束毫秒（不含）")
+
+
+class ClipPlanResponse(BaseModel):
+    segments: list[ClipSegment] = Field(
+        ..., description="合并后的成片片段：源录音区间重叠或相接时合并，按源录音时间升序")
+    total_duration: int = Field(
+        ..., description="成片总时长（毫秒），等于各片段时长之和")
+    selections: list[ClipSelectionResult] = Field(
+        ..., description="每个选中字符区间的成片归属与时间，按输入顺序返回")

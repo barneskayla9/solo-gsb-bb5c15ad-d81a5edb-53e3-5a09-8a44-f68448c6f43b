@@ -157,6 +157,68 @@ class RedactRequest(AlignRequest):
     )
 
 
+class ClipSelection(BaseModel):
+    """单个选中区间：修订稿上的非空半开字符区间 [start_index, end_index)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_index: StrictInt = Field(
+        ..., description="选中区间在修订稿中的起始字符下标（从 0 开始，半开区间）"
+    )
+    end_index: StrictInt = Field(
+        ..., description="选中区间在修订稿中的结束字符下标（不含该位置）"
+    )
+
+
+class ClipPlanRequest(AlignRequest):
+    """校时输入、1～20 个按修订稿顺序排列且互不重叠的选中区间与片段留白。"""
+
+    selections: list[ClipSelection] = Field(
+        ..., min_length=1, max_length=20,
+        description=(
+            "按修订稿顺序排列的非空半开字符区间（1～20 个）；互不重叠，端点相接合法"),
+    )
+    padding_ms: StrictInt = Field(
+        ..., ge=0, le=2000,
+        description="每个源录音区间向两侧扩展的留白毫秒数（0～2000）",
+    )
+
+
+class ClipSegment(BaseModel):
+    """一个合并后的成片片段：源录音区间与其在成片中的区间。"""
+
+    source_start: int = Field(
+        ..., description="源录音起始毫秒（含），留白扩展后已裁剪到录音边界")
+    source_end: int = Field(
+        ..., description="源录音结束毫秒（不含），留白扩展后已裁剪到录音边界")
+    cut_start: int = Field(..., description="该片段在成片中的起始毫秒（含）")
+    cut_end: int = Field(..., description="该片段在成片中的结束毫秒（不含）")
+
+
+class ClipSelectionPlan(BaseModel):
+    """单个选中字符区间的成片规划：所属合并段及其在成片中的起止时间。"""
+
+    start_index: int = Field(
+        ..., description="选中区间在修订稿中的起始字符下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="选中区间在修订稿中的结束字符下标（不含该位置）")
+    text: str = Field(..., description="该选中区间在修订稿中的原文")
+    segment_index: int = Field(
+        ..., description="所属合并段的下标（segments 从 0 开始）")
+    start: int = Field(..., description="选中区间在成片中的起始毫秒，取首字符时间轴 start")
+    end: int = Field(..., description="选中区间在成片中的结束毫秒，取末字符时间轴 end")
+
+
+class ClipPlanResponse(BaseModel):
+    segments: list[ClipSegment] = Field(
+        ..., description=(
+            "合并后的成片片段，按源录音时间顺序；已把重叠或相接的源区间合并，"
+            "避免声音重复"))
+    total_duration: int = Field(..., description="成片总时长（毫秒），等于各合并段时长之和")
+    selections: list[ClipSelectionPlan] = Field(
+        ..., description="每个选中字符区间的成片规划，按输入顺序返回")
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")

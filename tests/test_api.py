@@ -1912,3 +1912,297 @@ def test_redact_extra_field_rejected(client):
         "terms": ["机密"], "padding_ms": 0, "bogus": 1})
     assert r.status_code == 422
     assert "不允许" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 成片切片规划 POST /clip-plan
+# ---------------------------------------------------------------------------
+def _clip(client, items, revised, selections, padding_ms=0, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "selections": selections,
+        "padding_ms": padding_ms,
+    }
+    return client.post("/clip-plan", json=payload)
+
+
+def _sel(s, e):
+    return {"start_index": s, "end_index": e}
+
+
+def _clip_items():
+    # 你[0,100] 好[200,300] 呀(computed)[300,400] 世[500,600] 界[700,800]
+    return [
+        ("你", 0, 100), ("好", 200, 300), ("世", 500, 600), ("界", 700, 800),
+    ]
+
+
+def test_clip_plan_two_separate_segments(client):
+    # 留白 50：[0,300] -> [0,350]；[500,800] -> [450,850]，两段分离
+    r = _clip(client, _clip_items(), "你好呀世界",
+              [_sel(0, 2), _sel(3, 5)], padding_ms=50)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "segments": [
+            {"source_start": 0, "source_end": 350,
+             "cut_start": 0, "cut_end": 350},
+            {"source_start": 450, "source_end": 850,
+             "cut_start": 350, "cut_end": 750},
+        ],
+        "total_duration": 750,
+        "selections": [
+            {"start_index": 0, "end_index": 2, "text": "你好",
+             "segment_index": 0, "start": 0, "end": 300},
+            {"start_index": 3, "end_index": 5, "text": "世界",
+             "segment_index": 1, "start": 400, "end": 700},
+        ],
+    }
+
+
+def test_clip_plan_padding_bridges_gap_merges_segments(client):
+    # 留白 100：第一段 [0,400]、第二段 [400,900] 端点相接 -> 合并成一段，
+    # 声音不重复；两个选择各自的成片时间不被留白影响（核心区间整体平移）
+    r = _clip(client, _clip_items(), "你好呀世界",
+              [_sel(0, 2), _sel(3, 5)], padding_ms=100)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "segments": [
+            {"source_start": 0, "source_end": 900,
+             "cut_start": 0, "cut_end": 900},
+        ],
+        "total_duration": 900,
+        "selections": [
+            {"start_index": 0, "end_index": 2, "text": "你好",
+             "segment_index": 0, "start": 0, "end": 300},
+            {"start_index": 3, "end_index": 5, "text": "世界",
+             "segment_index": 0, "start": 500, "end": 800},
+        ],
+    }
+
+
+def test_clip_plan_padding_clamped_to_recording_bounds(client):
+    # “你”核心 [0,100] 留白 200：起点裁剪到 0
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(0, 1)],
+              padding_ms=200)
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"] == [
+        {"source_start": 0, "source_end": 300,
+         "cut_start": 0, "cut_end": 300}]
+
+    # “界”核心 [700,800] 留白 300：终点裁剪到 1000
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(4, 5)],
+              padding_ms=300)
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"] == [
+        {"source_start": 400, "source_end": 1000,
+         "cut_start": 0, "cut_end": 600}]
+    # 选择成片区间为源内偏移：核心在合并段 [400,1000) 内的 [300,400)
+    assert r.json()["selections"] == [
+        {"start_index": 4, "end_index": 5, "text": "界",
+         "segment_index": 0, "start": 300, "end": 400}]
+
+
+def test_clip_plan_touching_char_selections_keep_distinct_plans(client):
+    # [0,2)“你好” 与 [2,3)“呀” 字符区间端点相接，映射后源区间相接合并，
+    # 但仍分别返回两个选择的成片起止
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(0, 2), _sel(2, 3)])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["segments"] == [
+        {"source_start": 0, "source_end": 400,
+         "cut_start": 0, "cut_end": 400}]
+    assert body["total_duration"] == 400
+    assert body["selections"] == [
+        {"start_index": 0, "end_index": 2, "text": "你好",
+         "segment_index": 0, "start": 0, "end": 300},
+        {"start_index": 2, "end_index": 3, "text": "呀",
+         "segment_index": 0, "start": 300, "end": 400},
+    ]
+
+
+def test_clip_plan_uses_computed_timeline_for_inserted_char(client):
+    # 新增字符“呀”推算 [300,400]，直接作为一个选择
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(2, 3)])
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "segments": [
+            {"source_start": 300, "source_end": 400,
+             "cut_start": 0, "cut_end": 100}],
+        "total_duration": 100,
+        "selections": [
+            {"start_index": 2, "end_index": 3, "text": "呀",
+             "segment_index": 0, "start": 0, "end": 100}],
+    }
+
+
+def test_clip_plan_segments_concatenate_without_gaps(client):
+    # 多段成片总时长等于各段时长之和，后段 cut_start 等于前段 cut_end
+    r = _clip(client, _clip_items(), "你好呀世界",
+              [_sel(0, 1), _sel(3, 4)], padding_ms=50)
+    assert r.status_code == 200, r.text
+    segs = r.json()["segments"]
+    assert segs == [
+        {"source_start": 0, "source_end": 150,
+         "cut_start": 0, "cut_end": 150},
+        {"source_start": 450, "source_end": 650,
+         "cut_start": 150, "cut_end": 350},
+    ]
+    assert r.json()["total_duration"] == 350
+
+
+def test_clip_plan_reuses_alignment_validation(client):
+    r = _clip(client, [("a", 300, 100)], "a", [_sel(0, 1)], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_clip_plan_empty_selection_rejected(client):
+    # start_index == end_index：空区间非法
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(1, 1)])
+    assert r.status_code == 422
+    assert "非空半开区间" in r.json()["detail"]
+
+
+def test_clip_plan_inverted_selection_rejected(client):
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(2, 1)])
+    assert r.status_code == 422
+    assert "非空半开区间" in r.json()["detail"]
+
+
+def test_clip_plan_selection_out_of_text_rejected(client):
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(0, 9)])
+    assert r.status_code == 422
+    assert "超出修订稿范围" in r.json()["detail"]
+
+
+def test_clip_plan_negative_index_rejected(client):
+    r = _clip(client, _clip_items(), "你好呀世界", [_sel(-1, 1)])
+    assert r.status_code == 422
+    assert "超出修订稿范围" in r.json()["detail"]
+
+
+def test_clip_plan_unsorted_selections_rejected(client):
+    r = _clip(client, _clip_items(), "你好呀世界",
+              [_sel(3, 5), _sel(0, 2)])
+    assert r.status_code == 422
+    assert "按修订稿顺序" in r.json()["detail"]
+
+
+def test_clip_plan_overlapping_selections_rejected(client):
+    r = _clip(client, _clip_items(), "你好呀世界",
+              [_sel(0, 3), _sel(2, 4)])
+    assert r.status_code == 422
+    assert "互不重叠" in r.json()["detail"]
+
+
+def test_clip_plan_selections_count_range(client):
+    empty = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界", "selections": [], "padding_ms": 0})
+    assert empty.status_code == 422
+    assert "1～20" in empty.json()["detail"]
+
+    # 20 个单字符区间恰好合法（文本不足 20 字时用 20 字文本）
+    items = rc([("a", 10 * i, 10 * i + 5) for i in range(20)])
+    ok = client.post("/clip-plan", json={
+        "recognized": items, "total_duration": 300,
+        "revised_text": "a" * 20,
+        "selections": [_sel(i, i + 1) for i in range(20)],
+        "padding_ms": 0})
+    assert ok.status_code == 200, ok.text
+    assert len(ok.json()["selections"]) == 20
+
+    too_many = client.post("/clip-plan", json={
+        "recognized": items, "total_duration": 300,
+        "revised_text": "a" * 21,
+        "selections": [_sel(i, i + 1) for i in range(21)],
+        "padding_ms": 0})
+    assert too_many.status_code == 422
+    assert "1～20" in too_many.json()["detail"]
+
+
+def test_clip_plan_zero_duration_mapped_selection_rejected(client):
+    # 零时长录音里所有字符时间均为 [0,0]，映射后零时长 -> 422
+    r = client.post("/clip-plan", json={
+        "recognized": [{"char": "a", "start": 0, "end": 0}],
+        "total_duration": 0, "revised_text": "a",
+        "selections": [_sel(0, 1)], "padding_ms": 0})
+    assert r.status_code == 422
+    assert "零时长" in r.json()["detail"]
+
+
+def test_clip_plan_zero_duration_internal_char_allowed(client):
+    # 区间内部包含零时长字符，但整体正时长，合法
+    r = client.post("/clip-plan", json={
+        "recognized": [
+            {"char": "a", "start": 100, "end": 200},
+            {"char": "。", "start": 200, "end": 200},
+            {"char": "b", "start": 200, "end": 300},
+        ],
+        "total_duration": 400, "revised_text": "a。b",
+        "selections": [_sel(0, 3)], "padding_ms": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"] == [
+        {"source_start": 100, "source_end": 300,
+         "cut_start": 0, "cut_end": 200}]
+
+
+def test_clip_plan_padding_ms_range(client):
+    for bad in (-1, 2001):
+        r = _clip(client, _clip_items(), "你好呀世界", [_sel(0, 1)],
+                  padding_ms=bad)
+        assert r.status_code == 422, (bad, r.text)
+        assert "0～2000" in r.json()["detail"]
+    for good in (0, 2000):
+        r = _clip(client, _clip_items(), "你好呀世界", [_sel(0, 1)],
+                  padding_ms=good)
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_clip_plan_padding_ms_wrong_type(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界", "selections": [_sel(0, 1)],
+        "padding_ms": "50"})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_clip_plan_selection_wrong_type(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界",
+        "selections": [{"start_index": "0", "end_index": 1}],
+        "padding_ms": 0})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_clip_plan_missing_fields_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界"})
+    assert r.status_code == 422
+    assert "selections" in r.json()["detail"]
+    assert "padding_ms" in r.json()["detail"]
+
+
+def test_clip_plan_extra_field_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界",
+        "selections": [_sel(0, 1)], "padding_ms": 0, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_clip_plan_selection_extra_field_rejected(client):
+    r = client.post("/clip-plan", json={
+        "recognized": rc(_clip_items()), "total_duration": 1000,
+        "revised_text": "你好呀世界",
+        "selections": [{"start_index": 0, "end_index": 1, "bogus": 1}],
+        "padding_ms": 0})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

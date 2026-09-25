@@ -19,6 +19,7 @@
 - 支持 `POST /entity-links`：复用校时输入与逐字时间轴，按实体别名精确命中与时间桶生成采访对象的共提及关系（边权 = 共同出现的桶数）。
 - 支持 `POST /annotation-migrate`：对旧版修订文本与新版修订稿做全局顺序对齐，按相同字符的匹配关系把旧稿批注区间迁移到新稿（complete/partial/orphan），并给出新稿片段的首末毫秒。
 - 支持 `POST /redact`：复用校时输入与逐字时间轴，对修订文本做敏感词精确命中脱敏（等长 █ 遮蔽），并给出扩展 padding、裁剪到录音边界后的音频静音毫秒区间。
+- 支持 `POST /clip-plan`：复用校时输入与逐字时间轴，把修订稿的 1～20 个非空字符区间映射为源录音片段，扩展留白、裁到录音边界并合并重叠/相接区间（避免声音重复），输出每个合并段的源录音起止、成片起止、成片总时长及每个选中区间的成片时间。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -43,6 +44,7 @@ docker compose up --build -d
 - 实体共提及接口：`POST http://localhost:8000/entity-links`
 - 批注迁移接口：`POST http://localhost:8000/annotation-migrate`
 - 敏感词脱敏接口：`POST http://localhost:8000/redact`
+- 成片切片接口：`POST http://localhost:8000/clip-plan`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -695,6 +697,96 @@ curl -X POST http://localhost:8000/redact \
   `[300,500]` 扩 30ms 得 `[270,530]`；若 padding 加大使两者重叠或相接，
   会进一步合并为一个区间。
 
+### `POST /clip-plan`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，把修订稿中选中的
+**1～20 个非空半开字符区间**沿逐字时间轴映射成源录音片段，按留白向两侧扩展并
+裁剪到录音边界，再把**重叠或相接**的源录音区间合并为成片片段（合并保证同一段
+录音在成片中只出现一次，**避免声音重复**），最后按源时间顺序把各合并段
+**无间隙拼接**为成片。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `selections` | 数组 | 选中区间列表，数量 `1～20`；元素为 `{"start_index","end_index"}` |
+| `selections[].start_index` | 整数 | 在 `revised_text` 中的起始字符下标（从 0 开始，半开区间） |
+| `selections[].end_index` | 整数 | 结束字符下标（不含该位置），须大于 `start_index` |
+| `padding_ms` | 整数 | 每个源录音区间向两侧扩展的留白毫秒数，允许 `0～2000` |
+
+选中区间校验要求（不满足返回 **422** 中文原因）：
+
+- 数量为 `1～20` 个；
+- 均为修订稿上的**非空半开区间**（`0 <= start_index < end_index <= len(revised_text)`）；
+- **按修订稿顺序排列且互不重叠**——端点相接合法（上一区间 `end_index` 等于
+  下一区间 `start_index` 不算重叠）；
+- 区间映射到时间轴后（首字 `start` 到末字 `end`）为**零时长**也返回 422。
+
+处理规则：
+
+1. 每个选中区间映射为源录音区间 `[首字 start, 末字 end)`（`computed` 推算
+   字符同样参与）；零时长映射（如零时长录音）判为非法；
+2. 向两侧各扩展 `padding_ms`，并裁剪到录音边界 `[0, total_duration]`；
+3. 把**重叠或相接**的扩展区间合并为成片片段，消除声音重复；
+4. 合并段按源时间顺序拼接：第一段成片 `[0, 段时长)`，之后每段 `cut_start`
+   等于前一段 `cut_end`（不留间隙）；`total_duration` 为各段时长之和；
+5. 每个选中区间返回其所属合并段（`segment_index` 指向 `segments`）及该区间
+   核心内容（不含留白）在成片中的 `start` / `end`。
+
+示例（选中“你好”和“世界”两段，各留 50 毫秒白噪音缓冲）：
+
+```bash
+curl -X POST http://localhost:8000/clip-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":500,"end":600},
+      {"char":"界","start":700,"end":800}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好呀世界",
+    "selections": [
+      {"start_index": 0, "end_index": 2},
+      {"start_index": 3, "end_index": 5}
+    ],
+    "padding_ms": 50
+  }'
+```
+
+响应：
+
+```json
+{
+  "segments": [
+    {"source_start": 0, "source_end": 350, "cut_start": 0, "cut_end": 350},
+    {"source_start": 450, "source_end": 850, "cut_start": 350, "cut_end": 750}
+  ],
+  "total_duration": 750,
+  "selections": [
+    {"start_index": 0, "end_index": 2, "text": "你好", "segment_index": 0, "start": 0, "end": 300},
+    {"start_index": 3, "end_index": 5, "text": "世界", "segment_index": 1, "start": 400, "end": 700}
+  ]
+}
+```
+
+字段说明：
+
+- `segments`：合并后的成片片段，按源录音时间顺序。
+  - `source_start` / `source_end`：该片段在源录音中的半开毫秒区间，已扩展留白
+    并裁剪到录音边界；
+  - `cut_start` / `cut_end`：该片段在成片中的半开毫秒区间，各段首尾相接。
+- `total_duration`：成片总时长（毫秒），等于所有合并段时长之和。
+- `selections`：按**输入顺序**返回每个选中区间的成片规划。
+  - `start_index` / `end_index` / `text`：选中区间的半开字符下标与原文；
+  - `segment_index`：所属合并段在 `segments` 中的下标；
+  - `start` / `end`：选中区间核心内容（**不含**留白）在成片中的毫秒时间。
+- 上例中“你好”映射 `[0,300]`，扩 50 并裁到起点得源区间 `[0,350]`；“世界”映射
+  `[500,800]`，扩 50 得 `[450,850]`，两段分离。若把 `padding_ms` 增大到 100，
+  两个扩展区间 `[0,400]` 与 `[400,900]` 端点相接，会合并为**一个**合并段
+  `[0,900)`，成片总时长 900，两个选择仍分别标注其在同一片段中的成片时间。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -713,7 +805,9 @@ curl -X POST http://localhost:8000/redact \
 实体 ID 为空或重复、别名数量不在 1～5、别名为空或全局重复、
 `bucket_ms` 不在 1000～60000、`/annotation-migrate` 的批注数量不在 1～100、
 批注 ID 为空或重复、区间为空或越出旧版修订文本，以及 `/redact` 的敏感词数量
-不在 1～50、敏感词为空或重复、`padding_ms` 不在 0～1000 等。
+不在 1～50、敏感词为空或重复、`padding_ms` 不在 0～1000，以及 `/clip-plan`
+的选中区间数量不在 1～20、区间为空/越界/未按修订稿顺序排列/互相重叠、
+区间映射后为零时长、`padding_ms` 不在 0～2000 等。
 
 ---
 
@@ -770,6 +864,7 @@ app/
   entity_links.py    实体共提及（别名精确命中最优选择、时间桶归集与共现边权）
   annotation.py      批注迁移（旧新文本全局对齐、存活字符最小覆盖区间与状态判定）
   redact.py          敏感词脱敏（精确命中合并、等长 █ 遮蔽与静音毫秒区间生成）
+  clip_plan.py       成片切片（字符区间映射、留白裁剪、重叠相接源区间合并与成片时间）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码
